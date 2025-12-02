@@ -23,7 +23,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
+	"sync"
+	
 	"github.com/nats-io/nats.go/jetstream"
 	iu "github.com/nats-io/natscli/internal/util"
 	"github.com/synadia-io/orbit.go/jetstreamext"
@@ -59,6 +60,7 @@ type pubCmd struct {
 	quiet        bool
 	templates    bool
 	atomic       bool
+	parallel     int
 
 	atomicPending []*nats.Msg
 }
@@ -101,7 +103,8 @@ Available template functions are:
 	pub.Flag("quiet", "Show just the output received").Short('q').UnNegatableBoolVar(&c.quiet)
 	pub.Flag("templates", "Enables template functions in the body and subject (does not affect headers)").Default("true").BoolVar(&c.templates)
 	pub.Flag("atomic", "Atomic batch publish to Jetstream (implies --jetstream)").UnNegatableBoolVar(&c.atomic)
-
+	pub.Flag("parallel", "Number of parallel Jetstream publishers").Default("1").IntVar(&c.parallel)
+	
 	requestHelp := `Body and Header values of the messages may use Go templates to 
 create unique messages.
 
@@ -341,56 +344,115 @@ func (c *pubCmd) addToBatch() error {
 }
 
 func (c *pubCmd) doJetstream(nc *nats.Conn, progress *progress.Tracker) error {
+
+	// Create a pool of NATS connections
+    connPool := make([]*nats.Conn, c.parallel)
+    for i := 0; i < c.parallel; i++ {
+        nc, err := newNatsConn("", natsOpts()...)
+        if err != nil {
+            // Clean up any opened connections
+            for _, cnn := range connPool {
+                if cnn != nil {
+                    cnn.Close()
+                }
+            }
+            return fmt.Errorf("failed to create NATS connection %d: %v", i, err)
+        }
+        connPool[i] = nc
+    }
+    defer func() {
+        for _, nc := range connPool {
+            nc.Close()
+        }
+    }()
+	
+    var (
+        wg      sync.WaitGroup
+        errCh   = make(chan error, c.cnt)
+    )
+    sem := make(chan struct{}, c.parallel) // limit concurrency
+
+	start := time.Now()
+	
 	for i := 1; i <= c.cnt; i++ {
-		start := time.Now()
-		body, subj := c.parseTemplates("", i)
+	
+	    wg.Add(1)
+		sem <- struct{}{}
+		go func(seq int) {
+            defer wg.Done()
+            defer func() { <-sem }() // Release slot		
+			
+			// Pick a connection based on seq (modulo parallelism, round robin)
+            nc := connPool[seq%c.parallel]
+			
+			body, subj := c.parseTemplates("", seq)
 
-		msg, err := c.prepareMsg(subj, []byte(body), i)
-		if err != nil {
-			return err
-		}
-
-		if !c.quiet {
-			log.Printf("Published %d bytes to %q\n", len(body), c.subject)
-		}
-		resp, err := nc.RequestMsg(msg, opts().Timeout)
-		if err != nil {
-			return err
-		}
-
-		ack, err := jsm.ParsePubAck(resp)
-		if err != nil {
-			return err
-		}
-
-		if opts().Trace {
-			fmt.Printf("<<< %+v\n", string(resp.Data))
-		}
-
-		if progress != nil {
-			progress.Increment(1)
-		} else if !c.quiet {
-			msg := fmt.Sprintf("Stored in Stream: %s Sequence: %s", ack.Stream, f(ack.Sequence))
-			if ack.Domain != "" {
-				msg += fmt.Sprintf(" Domain: %q", ack.Domain)
+			msg, err := c.prepareMsg(subj, []byte(body), seq)
+			if err != nil {
+				errCh <- err
+				return
 			}
-			if ack.Duplicate {
-				msg += " Duplicate: true"
-			}
-			if ack.Value != "" {
-				msg += fmt.Sprintf(" Counter Value: %s", ack.Value)
-			}
-			log.Printf(msg)
-		}
 
-		// If applicable, account for the wait duration in a publish sleep.
-		if c.cnt > 1 && c.sleep > 0 {
-			st := c.sleep - time.Since(start)
-			if st > 0 {
-				time.Sleep(st)
+			if !c.quiet {
+				log.Printf("Published %d bytes to %q\n", len(body), c.subject)
 			}
+			
+			resp, err := nc.RequestMsg(msg, opts().Timeout)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			ack, err := jsm.ParsePubAck(resp)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			if opts().Trace {
+				fmt.Printf("<<< %+v\n", string(resp.Data))
+			}
+
+			if progress != nil {
+				progress.Increment(1)
+			} else if !c.quiet {
+				msg := fmt.Sprintf("Stored in Stream: %s Sequence: %s", ack.Stream, f(ack.Sequence))
+				if ack.Domain != "" {
+					msg += fmt.Sprintf(" Domain: %q", ack.Domain)
+				}
+				if ack.Duplicate {
+					msg += " Duplicate: true"
+				}
+				if ack.Value != "" {
+					msg += fmt.Sprintf(" Counter Value: %s", ack.Value)
+				}
+				log.Printf(msg)
+			}
+			
+			// Optional: throttle inside goroutine
+            if c.sleep > 0 {
+                time.Sleep(c.sleep)
+            }			
+		}(i)			
+    }
+	
+	// If applicable, account for the wait duration in a publish sleep.
+	if c.cnt > 1 && c.sleep > 0 {
+		st := c.sleep - time.Since(start)
+		if st > 0 {
+			time.Sleep(st)
 		}
 	}
+	
+    wg.Wait()
+    close(errCh)
+	
+	// accumulate errors
+    for err := range errCh {
+        if err != nil {
+            return err
+        }
+    }	
 
 	return nil
 }
