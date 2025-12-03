@@ -422,7 +422,7 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 						jsw.PublishAsyncComplete()
 						for _, f := range pendingAcks {
 							if err := f.Err(); err != nil {
-								sendErr(fmt.Errorf("worker %d: async ack error: %w", workerID, err))
+								sendErr(fmt.Errorf("worker %d: async ack error: %v", workerID, err))
 								return
 							}
 						}
@@ -452,7 +452,7 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 			jsw.PublishAsyncComplete()
 			for _, f := range pendingAcks {
 				if err := f.Err(); err != nil {
-					sendErr(fmt.Errorf("worker %d: async ack error: %w", workerID, err))
+					sendErr(fmt.Errorf("worker %d: async ack error: %v", workerID, err))
 				}
 			}
 			return
