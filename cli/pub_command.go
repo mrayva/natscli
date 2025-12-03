@@ -348,15 +348,12 @@ func (c *pubCmd) addToBatch() error {
 // (for send-on=newline or repeated invocations) do not create/close connections
 // for every single publish.
 func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
-	// Use the outer ctx (signal-aware) as parent (created in publish()).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	if c.parallel <= 0 {
 		c.parallel = 1
 	}
-
-	// Ensure pool is initialized once for the lifetime of the CLI publish session.
 	servers := ""
 	if opts().Config != nil {
 		servers = opts().Config.ServerURL()
@@ -370,6 +367,7 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 
 	var wg sync.WaitGroup
 	var progMu sync.Mutex
+	const maxPending = 64
 
 	sendErr := func(err error) {
 		select {
@@ -379,91 +377,88 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 		}
 	}
 
-	// Start worker goroutines; each worker takes a dedicated connection from the pool.
 	for w := 0; w < c.parallel; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-
-			// Grab a persistent connection from the pool (do NOT close it here).
 			ncw := GetJSConn(workerID)
 			if ncw == nil {
 				sendErr(fmt.Errorf("worker %d: no pooled connection available", workerID))
 				return
 			}
-
-			// Install per-worker diagnostic handlers (optional, safe to re-set).
-			ncw.SetClosedHandler(func(_ *nats.Conn) {
-				log.Printf("worker %d: pooled connection closed (LastError=%v)", workerID, ncw.LastError())
-			})
-			ncw.SetDisconnectErrHandler(func(_ *nats.Conn, err error) {
-				log.Printf("worker %d: pooled connection disconnected: %v", workerID, err)
-			})
-			ncw.SetReconnectHandler(func(_ *nats.Conn) {
-				log.Printf("worker %d: pooled connection reconnected to %s", workerID, ncw.ConnectedUrlRedacted())
-			})
-			ncw.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-				log.Printf("worker %d: pooled connection async error: %v", workerID, err)
-			})
-
 			jsw, err := ncw.JetStream()
 			if err != nil {
 				sendErr(fmt.Errorf("worker %d: JetStream(): %w", workerID, err))
 				return
 			}
+			// Track outstanding async acks
+			var pendingAcks []nats.PubAckFuture
 
 			for {
 				select {
 				case <-ctx.Done():
-					return
+					goto WaitForAcks
 				case seq, ok := <-jobs:
 					if !ok {
-						return
+						goto WaitForAcks
 					}
-
 					body, subj := c.parseTemplates("", seq)
 					msg, err := c.prepareMsg(subj, []byte(body), seq)
 					if err != nil {
 						sendErr(fmt.Errorf("worker %d: prepareMsg: %w", workerID, err))
 						return
 					}
-
 					if !c.quiet {
-						log.Printf("Published %d bytes to %q\n", len(body), c.subject)
+						log.Printf("Published (async) %d bytes to %q\n", len(body), c.subject)
 					}
-
-					// Synchronous JetStream publish using pooled connection's JetStream context.
-					pubAck, err := jsw.PublishMsg(msg)
+					ackFuture, err := jsw.PublishMsgAsync(msg)
 					if err != nil {
-						sendErr(fmt.Errorf("worker %d: PublishMsg: %w", workerID, err))
+						sendErr(fmt.Errorf("worker %d: PublishMsgAsync: %w", workerID, err))
 						return
 					}
-
-					if opts().Trace {
-						fmt.Printf("<<< %+v\n", pubAck)
+					pendingAcks = append(pendingAcks, ackFuture)
+					if len(pendingAcks) >= maxPending {
+						// Wait for acks
+						jsw.PublishAsyncComplete()
+						for _, f := range pendingAcks {
+							if err := f.Err(); err != nil {
+								sendErr(fmt.Errorf("worker %d: async ack error: %w", workerID, err))
+								return
+							}
+						}
+						pendingAcks = pendingAcks[:0]
 					}
-
+					if opts().Trace {
+						fmt.Printf("<<< async queued\n")
+					}
 					if progress != nil {
 						progMu.Lock()
 						progress.Increment(1)
 						progMu.Unlock()
 					} else if !c.quiet {
-						log.Printf("Stored ack: %+v", pubAck)
+						log.Printf("Queued async publish to subject %s", c.subject)
 					}
-
 					if c.sleep > 0 {
 						select {
 						case <-ctx.Done():
-							return
+							goto WaitForAcks
 						case <-time.After(c.sleep):
 						}
 					}
 				}
 			}
+		WaitForAcks:
+			// Wait for remaining async acks
+			jsw.PublishAsyncComplete()
+			for _, f := range pendingAcks {
+				if err := f.Err(); err != nil {
+					sendErr(fmt.Errorf("worker %d: async ack error: %w", workerID, err))
+				}
+			}
+			return
 		}(w)
 	}
 
-	// Feed jobs to the workers.
 	go func() {
 		defer close(jobs)
 		for i := 1; i <= c.cnt; i++ {
@@ -475,10 +470,8 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 		}
 	}()
 
-	// Wait for workers to finish.
 	wg.Wait()
 
-	// Return first error if any.
 	select {
 	case err := <-errCh:
 		return err
