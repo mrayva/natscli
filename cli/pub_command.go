@@ -16,6 +16,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -103,7 +104,7 @@ Available template functions are:
 	pub.Flag("quiet", "Show just the output received").Short('q').UnNegatableBoolVar(&c.quiet)
 	pub.Flag("templates", "Enables template functions in the body and subject (does not affect headers)").Default("true").BoolVar(&c.templates)
 	pub.Flag("atomic", "Atomic batch publish to Jetstream (implies --jetstream)").UnNegatableBoolVar(&c.atomic)
-	pub.Flag("parallel", "Number of parallel Jetstream publishers").Default("1").IntVar(&c.parallel)
+	pub.Flag("parallel", "Number of parallel JetStream publishers (worker connections)").Default("1").IntVar(&c.parallel)
 
 	requestHelp := `Body and Header values of the messages may use Go templates to 
 create unique messages.
@@ -343,118 +344,147 @@ func (c *pubCmd) addToBatch() error {
 	return nil
 }
 
-func (c *pubCmd) doJetstream(nc *nats.Conn, progress *progress.Tracker) error {
+// doJetstream (replaced) - reuses a persistent connection pool so repeated calls
+// (for send-on=newline or repeated invocations) do not create/close connections
+// for every single publish.
+func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
+	// Use the outer ctx (signal-aware) as parent (created in publish()).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Create a pool of NATS connections
-	connPool := make([]*nats.Conn, c.parallel)
-	for i := 0; i < c.parallel; i++ {
-		nc, err := newNatsConn("", natsOpts()...)
-		if err != nil {
-			// Clean up any opened connections
-			for _, cnn := range connPool {
-				if cnn != nil {
-					cnn.Close()
+	if c.parallel <= 0 {
+		c.parallel = 1
+	}
+
+	// Ensure pool is initialized once for the lifetime of the CLI publish session.
+	servers := ""
+	if opts().Config != nil {
+		servers = opts().Config.ServerURL()
+	}
+	if err := InitJSConnPool(servers, c.parallel); err != nil {
+		return err
+	}
+
+	jobs := make(chan int)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	var progMu sync.Mutex
+
+	sendErr := func(err error) {
+		select {
+		case errCh <- err:
+			cancel()
+		default:
+		}
+	}
+
+	// Start worker goroutines; each worker takes a dedicated connection from the pool.
+	for w := 0; w < c.parallel; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			// Grab a persistent connection from the pool (do NOT close it here).
+			ncw := GetJSConn(workerID)
+			if ncw == nil {
+				sendErr(fmt.Errorf("worker %d: no pooled connection available", workerID))
+				return
+			}
+
+			// Install per-worker diagnostic handlers (optional, safe to re-set).
+			ncw.SetClosedHandler(func(_ *nats.Conn) {
+				log.Printf("worker %d: pooled connection closed (LastError=%v)", workerID, ncw.LastError())
+			})
+			ncw.SetDisconnectErrHandler(func(_ *nats.Conn, err error) {
+				log.Printf("worker %d: pooled connection disconnected: %v", workerID, err)
+			})
+			ncw.SetReconnectHandler(func(_ *nats.Conn) {
+				log.Printf("worker %d: pooled connection reconnected to %s", workerID, ncw.ConnectedUrlRedacted())
+			})
+			ncw.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+				log.Printf("worker %d: pooled connection async error: %v", workerID, err)
+			})
+
+			jsw, err := ncw.JetStream()
+			if err != nil {
+				sendErr(fmt.Errorf("worker %d: JetStream(): %w", workerID, err))
+				return
+			}
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case seq, ok := <-jobs:
+					if !ok {
+						return
+					}
+
+					body, subj := c.parseTemplates("", seq)
+					msg, err := c.prepareMsg(subj, []byte(body), seq)
+					if err != nil {
+						sendErr(fmt.Errorf("worker %d: prepareMsg: %w", workerID, err))
+						return
+					}
+
+					if !c.quiet {
+						log.Printf("Published %d bytes to %q\n", len(body), c.subject)
+					}
+
+					// Synchronous JetStream publish using pooled connection's JetStream context.
+					pubAck, err := jsw.PublishMsg(msg)
+					if err != nil {
+						sendErr(fmt.Errorf("worker %d: PublishMsg: %w", workerID, err))
+						return
+					}
+
+					if opts().Trace {
+						fmt.Printf("<<< %+v\n", pubAck)
+					}
+
+					if progress != nil {
+						progMu.Lock()
+						progress.Increment(1)
+						progMu.Unlock()
+					} else if !c.quiet {
+						log.Printf("Stored ack: %+v", pubAck)
+					}
+
+					if c.sleep > 0 {
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(c.sleep):
+						}
+					}
 				}
 			}
-			return fmt.Errorf("failed to create NATS connection %d: %v", i, err)
-		}
-		connPool[i] = nc
+		}(w)
 	}
-	defer func() {
-		for _, nc := range connPool {
-			nc.Close()
+
+	// Feed jobs to the workers.
+	go func() {
+		defer close(jobs)
+		for i := 1; i <= c.cnt; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- i:
+			}
 		}
 	}()
 
-	var (
-		wg    sync.WaitGroup
-		errCh = make(chan error, c.cnt)
-	)
-	sem := make(chan struct{}, c.parallel) // limit concurrency
-
-	start := time.Now()
-
-	for i := 1; i <= c.cnt; i++ {
-
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(seq int) {
-			defer wg.Done()
-			defer func() { <-sem }() // Release slot
-
-			// Pick a connection based on seq (modulo parallelism, round robin)
-			nc := connPool[seq%c.parallel]
-
-			body, subj := c.parseTemplates("", seq)
-
-			msg, err := c.prepareMsg(subj, []byte(body), seq)
-			if err != nil {
-				errCh <- err
-				return
-			}
-
-			if !c.quiet {
-				log.Printf("Published %d bytes to %q\n", len(body), c.subject)
-			}
-
-			resp, err := nc.RequestMsg(msg, opts().Timeout)
-			if err != nil {
-				errCh <- err
-				return
-			}
-
-			ack, err := jsm.ParsePubAck(resp)
-			if err != nil {
-				errCh <- err
-				return
-			}
-
-			if opts().Trace {
-				fmt.Printf("<<< %+v\n", string(resp.Data))
-			}
-
-			if progress != nil {
-				progress.Increment(1)
-			} else if !c.quiet {
-				msg := fmt.Sprintf("Stored in Stream: %s Sequence: %s", ack.Stream, f(ack.Sequence))
-				if ack.Domain != "" {
-					msg += fmt.Sprintf(" Domain: %q", ack.Domain)
-				}
-				if ack.Duplicate {
-					msg += " Duplicate: true"
-				}
-				if ack.Value != "" {
-					msg += fmt.Sprintf(" Counter Value: %s", ack.Value)
-				}
-				log.Printf(msg)
-			}
-
-			// Optional: throttle inside goroutine
-			if c.sleep > 0 {
-				time.Sleep(c.sleep)
-			}
-		}(i)
-	}
-
-	// If applicable, account for the wait duration in a publish sleep.
-	if c.cnt > 1 && c.sleep > 0 {
-		st := c.sleep - time.Since(start)
-		if st > 0 {
-			time.Sleep(st)
-		}
-	}
-
+	// Wait for workers to finish.
 	wg.Wait()
-	close(errCh)
 
-	// accumulate errors
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
+	// Return first error if any.
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
 	}
-
-	return nil
 }
 
 // readLine reads a full line from a bufio.Reader regardless of buffer size,
@@ -511,6 +541,9 @@ func (c *pubCmd) publish(_ *fisk.ParseContext) error {
 	}
 
 	complete := make(chan struct{})
+
+	// ensure pooled connections are closed when publish() returns
+	defer CloseJSConnPool()
 
 	// If a body is set, treat it as EOF, as no more input
 	eof := c.bodyIsSet
