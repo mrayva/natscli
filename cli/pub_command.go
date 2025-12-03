@@ -455,7 +455,6 @@ func (c *pubCmd) doJetstream(_ *nats.Conn, progress *progress.Tracker) error {
 					sendErr(fmt.Errorf("worker %d: async ack error: %v", workerID, err))
 				}
 			}
-			return
 		}(w)
 	}
 
